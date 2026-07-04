@@ -1,4 +1,5 @@
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, Response
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from uuid import uuid4
 import time
@@ -6,7 +7,6 @@ import base64
 
 app = FastAPI()
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,36 +25,56 @@ idempotency_store = {}
 client_requests = {}
 
 
+def check_rate_limit(client_id: str):
+    now = time.time()
+
+    history = client_requests.get(client_id, [])
+    history = [t for t in history if now - t < WINDOW]
+
+    if len(history) >= RATE_LIMIT:
+        retry_after = max(1, int(WINDOW - (now - history[0])))
+
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"},
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    history.append(now)
+    client_requests[client_id] = history
+    return None
+
+
 @app.post("/orders", status_code=201)
 def create_order(
     response: Response,
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-    x_client_id: str = Header("default", alias="X-Client-Id"),
+    x_client_id: str = Header(..., alias="X-Client-Id"),
 ):
-    now = time.time()
 
-    history = client_requests.get(x_client_id, [])
-    history = [t for t in history if now - t < WINDOW]
-
-    if len(history) >= RATE_LIMIT:
-        response.headers["Retry-After"] = "10"
-        raise HTTPException(429, "Rate limit exceeded")
-
-    history.append(now)
-    client_requests[x_client_id] = history
+    limited = check_rate_limit(x_client_id)
+    if limited:
+        return limited
 
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
 
     order = {"id": str(uuid4())}
-
     idempotency_store[idempotency_key] = order
 
     return order
 
 
 @app.get("/orders")
-def list_orders(limit: int = 10, cursor: str | None = None):
+def list_orders(
+    limit: int = 10,
+    cursor: str | None = None,
+    x_client_id: str = Header(..., alias="X-Client-Id"),
+):
+
+    limited = check_rate_limit(x_client_id)
+    if limited:
+        return limited
 
     start = 0
 
@@ -66,7 +86,6 @@ def list_orders(limit: int = 10, cursor: str | None = None):
     items = orders[start:end]
 
     next_cursor = None
-
     if end < TOTAL_ORDERS:
         next_cursor = base64.b64encode(str(end).encode()).decode()
 
